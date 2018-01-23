@@ -1,0 +1,518 @@
+
+import pandas as pd                 
+import lightgbm as lgb
+import hashlib
+import numpy as np
+import seaborn as sns
+import matplotlib.pyplot as plt
+from datetime import datetime
+import warnings
+warnings.filterwarnings('ignore')
+plt.style.use('ggplot')
+from sklearn import preprocessing
+# opcao de particionar o arquivo em 2. A aplicacao utiliza CrossValidation
+#from sklearn.model_selection import train_test_split
+#import gc
+#gc.collect()
+
+print("Início do Aplicacao", str(datetime.now()))
+print('Lendo train.csv')
+train = pd.read_csv('/posgraduacao/wsdm/train.csv')
+print('Lendo test.csv')
+test = pd.read_csv('/posgraduacao/wsdm/test.csv')
+# songs -------------------------------
+print('Lendo songs')
+songs = pd.read_csv('/posgraduacao/wsdm/songs.csv')
+# songs extras -------------------------------
+print('Lendo songs extras')
+extras = pd.read_csv('/posgraduacao/wsdm/song_extra_info.csv')
+#extras = extras.drop('name', 1)
+songs = pd.merge(songs, extras, on='song_id', how='left')
+del extras
+# members -----------------------------
+print('Lendo members.csv')
+dfm = pd.read_csv('/posgraduacao/wsdm/members.csv')
+
+trnulo = train.loc[(train['source_type'].isnull()) & (train['source_screen_name'].isnull()) & (train['source_system_tab'].isnull())].index
+print("total de registros excluidos porque a maioria dos atributos são nulos", len(trnulo))
+train = train.drop(trnulo)
+del trnulo
+
+tam_songs = len(songs)
+tam_artist = len(songs.loc[songs['artist_name'].isnull()])
+tam_composer = len(songs.loc[songs['composer'].isnull()])
+tam_lyricist = len(songs.loc[songs['lyricist'].isnull()])
+tam_language = len(songs.loc[songs['language'].isnull()])
+tam_genre = len(songs.loc[songs['genre_ids'].isnull()])
+tam_len = len(songs.loc[songs['song_length'].isnull()])
+tam_name = len(songs.loc[songs['name'].isnull()])
+tam_isrc = len(songs.loc[songs['isrc'].isnull() ])
+print("'artist_name': {0}".format(tam_artist), " ", tam_artist/tam_songs)
+print("'composer': {0}".format(tam_composer), " ", tam_composer/tam_songs)
+print("'lyricist': {0}".format(tam_lyricist), " ", tam_lyricist/tam_songs)
+print("'language': {0}".format(tam_language), " ", tam_language/tam_songs)
+print("'genre_ids': {0}".format(tam_genre), " ", tam_genre/tam_songs)
+print("'song_length': {0}".format(tam_len), " ", tam_len/tam_songs)
+print("'song name': {0}".format(tam_name), " ", tam_name/tam_songs)
+print("'isrc': {0}".format(tam_isrc), " ", tam_isrc/tam_songs)
+del tam_songs, tam_artist, tam_lyricist, tam_language, tam_genre, tam_len, tam_name, tam_isrc
+
+'''
+# alternativas de validar os dados
+songs.song_length.describe()
+songs['song_length'].median()
+songs['song_length'].mode()
+songs['song_length'].mean()
+songs['song_length'].min()
+songs['song_length'].std()
+'''
+# definicao dos valores constantes
+DEFAULT_ANO = 1000
+DEFAULT_GENRE_IDS = 8888
+DEFAULT_LANGUAGE = 77
+DEFAULT_SONG_NAME = 123456789
+DEFAULT_ISRC = 'AAYYY11010101'
+DEFAULT_PAIS = 494
+DEFAULT_PRODUTOR = 5555
+DEFAULT_LENGTH = 240000
+
+songs = songs.drop('lyricist', 1)
+songs = songs.drop('composer', 1)
+songs['genre_ids'].fillna(DEFAULT_GENRE_IDS, inplace=True)
+songs['isrc'].fillna(DEFAULT_ISRC, inplace=True)
+songs['language'].fillna(DEFAULT_LANGUAGE, inplace=True)
+songs['name'].fillna(DEFAULT_SONG_NAME, inplace=True)
+
+len_dfm = len(dfm)
+len_city = len(dfm.loc[dfm['city'].isnull()])
+len_bd = len(dfm.loc[dfm['bd'].isnull()])
+len_gender = len(dfm.loc[dfm['gender'].isnull()])
+len_register = len(dfm.loc[dfm['registered_via'].isnull()])
+len_init = len(dfm.loc[dfm['registration_init_time'].isnull()])
+len_expiration = len(dfm.loc[dfm['expiration_date'].isnull()])
+
+print("'city': {0}".format(len_city), len_city/len_dfm)
+print("'bd': {0}".format(len_bd), len_bd/len_dfm)
+print("'gender': {0}".format(len_gender), len_gender/len_dfm)
+print("'registered_via': {0}".format(len_register), len_register/len_dfm)
+print("'registration_init_time': {0}".format(len_init), len_init/len_dfm)
+print("'expiration_date': {0}".format(len_expiration), len_expiration/len_dfm)
+
+dfm = dfm.drop('gender', 1) 
+
+print('Definindo tempo de musicas')
+tempoMusica = [45000, 90000, 120000, 135000, 150000, 165000, 180000, 195000, 210000, 225000, 270000, 300000, 330000, 360000, 390000, 420000, 450000, 480000, 540000, 600000, 720000]
+musica = {'song_id': [], 
+          'song_length': [], 
+          'genero': [], 
+          'language': [], 
+          'songname': [], 
+          'artist': [], 
+          'ano':[], 
+          'produtor' : [], 
+          'pais': []}
+
+contador = len(songs)
+for item in songs.iterrows():
+    duracao = item[1]['song_length']
+      
+    artist = hashlib.md5(str(item[1]['artist_name']).encode('utf-8')).hexdigest()    
+    songname = hashlib.md5(str(item[1]['name']).encode('utf-8')).hexdigest()
+    genero = hashlib.md5(str(item[1]['genre_ids']).encode('utf-8')).hexdigest()
+
+    ano = DEFAULT_ANO
+    pais = hashlib.md5(str(DEFAULT_PAIS).encode('utf-8')).hexdigest()
+    produtor = hashlib.md5(str(DEFAULT_PRODUTOR).encode('utf-8')).hexdigest()
+    isrc = item[1]['isrc']
+    if type(isrc) == str and isrc != DEFAULT_ISRC:
+        ano = int(isrc[5:7]) + 1000
+        pais = hashlib.md5(str(isrc[0:2]).encode('utf-8')).hexdigest()
+        produtor = hashlib.md5(str(isrc[2:5]).encode('utf-8')).hexdigest()
+        
+    tempo = DEFAULT_LENGTH
+    for chave in tempoMusica:
+        if duracao <= chave:
+            tempo = chave
+            break
+    
+    musica['song_id'].append(item[1]['song_id'])
+    musica['song_length'].append(tempo)    
+    musica['ano'].append(ano)    
+    musica['pais'].append(int(pais[0:3], 16))
+    musica['produtor'].append(int(produtor[0:4], 16))
+    musica['genero'].append(int(genero[0:8], 16))
+    musica['artist'].append(int(artist[0:16], 16))
+    musica['songname'].append(int(songname[0:16], 16))        
+    musica['language'].append(item[1]['language'])
+    contador -= 1    
+    if contador % 10000 == 0:
+        print('alterados ', contador)
+        
+del duracao, item, tempo, tempoMusica, contador, artist, songname
+del songs
+songs = pd.DataFrame(musica)
+del musica
+
+# mapeando atributos e definindo valores constantes para os dados nulos
+# mapeado para numerico para verificar correlacoes
+DEFAULT_SOURCE_SCREEN = 666
+source_screen_name_dict = {"Local playlist more": 621,
+                           "Online playlist more": 622,
+                           "Radio": 623,
+                           "Unknown": 624,
+                           "Album more": 625,
+                           "Search": 626,
+                           "Artist more": 627,
+                           "Discover Feature": 628,
+                           "Discover Chart": 629,
+                           "Others profile more": 630,
+                           "Discover Genre": 631,
+                           "My library": 632,
+                           "Explore": 633,
+                           "Discover New": 634,
+                           "Search Trends": 635,
+                           "Search Home": 636,
+                           "My library_Search": 637,
+                           "Self profile more": 637,
+                           "Concert": 637,
+                           "Payment": 637}
+
+DEFAULT_SOURCE_TAB = 7171
+source_tab_dict = {"my library": 7711,
+                   "discover": 7712,
+                   "search": 7713,
+                   "radio": 7714,
+                   "listen with": 7715,
+                   "explore": 7716,
+                   "null": 7717,
+                   "notification": 7717,
+                   "settings": 7717}
+
+#train.source_type.value_counts()
+DEFAULT_SOURCE_TYPE = 4330
+source_type_dict = {"local-library": 4121,
+                    "online-playlist": 4122,
+                    "local-playlist": 4123,
+                    "radio": 4124,
+                    "album": 4125,
+                    "top-hits-for-artist": 4126,
+                    "song": 4127,
+                    "song-based-playlist": 4128,
+                    "listen-with": 4129,                    
+                    "topic-article-playlist": 4130,
+                    "artist": 4130,
+                    "my-daily-playlist": 4130}
+
+print('Mapeamento source screen, system, type')
+train['source_system_tab'] = train['source_system_tab'].map(source_tab_dict)
+test['source_system_tab'] = test['source_system_tab'].map(source_tab_dict)
+#train.source_system_tab.value_counts()
+#test.source_system_tab.value_counts()
+
+train['source_type'] = train['source_type'].map(source_type_dict)
+test['source_type'] = test['source_type'].map(source_type_dict)
+#train.source_type.value_counts()
+#test.source_type.value_counts()
+train['source_screen_name'] = train['source_screen_name'].map(source_screen_name_dict)
+test['source_screen_name'] = test['source_screen_name'].map(source_screen_name_dict)
+
+print('MErGE com as tabelas')
+train = pd.merge(train, songs, on='song_id', how='left')
+test = pd.merge(test, songs, on='song_id', how='left')
+train = pd.merge(train, dfm, on='msno', how='left')
+test = pd.merge(test, dfm, on='msno', how='left')
+del songs
+del dfm
+
+tam_treino = len(train)
+
+print("=== Missing - DataSet - Treino ===") 
+print("'source_screen_name': {0}".format(len(train.loc[train['source_screen_name'].isnull() ])))
+print("'source_system_tab': {0}".format(len(train.loc[train['source_system_tab'].isnull() ])))
+print("'source_type': {0}".format(len(train.loc[train['source_type'].isnull() ])))
+print("'song_length': {0}".format(len(train.loc[train['song_length'].isnull() ])))
+print("'language': {0}".format(len(train.loc[train['language'].isnull() ])))
+print("'city': {0}".format(len(train.loc[train['city'].isnull() ])))
+print("'registered_via': {0}".format(len(train.loc[train['registered_via'].isnull() ])))
+print("'ano': {0}".format(len(train.loc[train['ano'].isnull() ])))
+print("'produtor': {0}".format(len(train.loc[train['produtor'].isnull() ])))
+print("'pais': {0}".format(len(train.loc[train['pais'].isnull() ])))
+print("'artist': {0}".format(len(train.loc[train['artist'].isnull() ])))
+print("'songname': {0}".format(len(train.loc[train['songname'].isnull() ])))
+print("'genero': {0}".format(len(train.loc[train['genero'].isnull() ])))
+
+print("=== Missing - DataSet - Treino %%% ===") 
+print("'source_screen_name': {0}".format(len(train.loc[train['source_screen_name'].isnull() ])/tam_treino))
+print("'source_system_tab': {0}".format(len(train.loc[train['source_system_tab'].isnull() ])/tam_treino))
+print("'source_type': {0}".format(len(train.loc[train['source_type'].isnull() ])/tam_treino))
+print("'song_length': {0}".format(len(train.loc[train['song_length'].isnull() ])/tam_treino))
+print("'language': {0}".format(len(train.loc[train['language'].isnull() ])/tam_treino))
+print("'city': {0}".format(len(train.loc[train['city'].isnull() ])/tam_treino))
+print("'registered_via': {0}".format(len(train.loc[train['registered_via'].isnull() ])/tam_treino))
+print("'ano': {0}".format(len(train.loc[train['ano'].isnull() ])/tam_treino))
+print("'produtor': {0}".format(len(train.loc[train['produtor'].isnull() ])/tam_treino))
+print("'pais': {0}".format(len(train.loc[train['pais'].isnull() ])/tam_treino))
+print("'artist': {0}".format(len(train.loc[train['artist'].isnull() ])/tam_treino))
+print("'songname': {0}".format(len(train.loc[train['songname'].isnull() ])/tam_treino))
+print("'genero': {0}".format(len(train.loc[train['genero'].isnull() ])/tam_treino))
+
+tam_test = len(test)
+print("=== Missing - DataSet - Treino  ===") 
+print("'source_screen_name': {0}".format(len(test.loc[test['source_screen_name'].isnull() ])))
+print("'source_system_tab': {0}".format(len(test.loc[test['source_system_tab'].isnull() ])))
+print("'source_type': {0}".format(len(test.loc[test['source_type'].isnull() ])))
+print("'song_length': {0}".format(len(test.loc[test['song_length'].isnull() ])))
+print("'language': {0}".format(len(test.loc[test['language'].isnull() ])))
+print("'city': {0}".format(len(test.loc[test['city'].isnull() ])))
+print("'registered_via': {0}".format(len(test.loc[test['registered_via'].isnull() ])))
+print("'ano': {0}".format(len(test.loc[test['ano'].isnull() ])))
+print("'produtor': {0}".format(len(test.loc[test['produtor'].isnull() ])))
+print("'pais': {0}".format(len(test.loc[test['pais'].isnull() ])))
+print("'artist': {0}".format(len(test.loc[test['artist'].isnull() ])))
+print("'songname': {0}".format(len(test.loc[test['songname'].isnull() ])))
+print("'genero': {0}".format(len(test.loc[test['genero'].isnull() ])))
+
+print("=== Missing - DataSet - Treino %%% ===") 
+print("'source_screen_name': {0}".format(len(test.loc[test['source_screen_name'].isnull() ])/tam_test))
+print("'source_system_tab': {0}".format(len(test.loc[test['source_system_tab'].isnull() ])/tam_test))
+print("'source_type': {0}".format(len(test.loc[test['source_type'].isnull() ])/tam_test))
+print("'song_length': {0}".format(len(test.loc[test['song_length'].isnull() ])/tam_test))
+print("'language': {0}".format(len(test.loc[test['language'].isnull() ])/tam_test))
+print("'city': {0}".format(len(test.loc[test['city'].isnull() ])/tam_test))
+print("'registered_via': {0}".format(len(test.loc[test['registered_via'].isnull() ])/tam_test))
+print("'ano': {0}".format(len(test.loc[test['ano'].isnull() ])/tam_test))
+print("'produtor': {0}".format(len(test.loc[test['produtor'].isnull() ])/tam_test))
+print("'pais': {0}".format(len(test.loc[test['pais'].isnull() ])/tam_test))
+print("'artist': {0}".format(len(test.loc[test['artist'].isnull() ])/tam_test))
+print("'songname': {0}".format(len(test.loc[test['songname'].isnull() ])/tam_test))
+print("'genero': {0}".format(len(test.loc[test['genero'].isnull() ])/tam_test))
+
+train['source_screen_name'].fillna(DEFAULT_SOURCE_SCREEN,inplace=True)
+train['source_system_tab'].fillna(DEFAULT_SOURCE_TAB,inplace=True)
+train['source_type'].fillna(DEFAULT_SOURCE_TYPE,inplace=True)
+
+test['source_screen_name'].fillna(DEFAULT_SOURCE_SCREEN,inplace=True)
+test['source_system_tab'].fillna(DEFAULT_SOURCE_TAB,inplace=True)
+test['source_type'].fillna(DEFAULT_SOURCE_TYPE,inplace=True)
+
+train['ano'].fillna(DEFAULT_ANO,inplace=True)
+test['ano'].fillna(DEFAULT_ANO,inplace=True)
+
+train['language'].fillna(DEFAULT_LANGUAGE,inplace=True)
+test['language'].fillna(DEFAULT_LANGUAGE,inplace=True)
+
+train['songname'].fillna(DEFAULT_SONG_NAME,inplace=True)
+test['songname'].fillna(DEFAULT_SONG_NAME,inplace=True)
+
+train['genero'].fillna(DEFAULT_GENRE_IDS,inplace=True)
+test['genero'].fillna(DEFAULT_GENRE_IDS,inplace=True)
+
+train['pais'].fillna(DEFAULT_PAIS,inplace=True)
+test['pais'].fillna(DEFAULT_PAIS,inplace=True)
+
+train['produtor'].fillna(DEFAULT_PRODUTOR,inplace=True)
+test['produtor'].fillna(DEFAULT_PRODUTOR,inplace=True)
+# verificar correlacao
+sns.heatmap(train.corr())
+sns.heatmap(test.corr())
+#
+# 
+def gerarArqSubmete(predictions, nomeArquivo):
+    print("salvando arquivo de  predicao. tamanho->", len(predictions))
+    subm = {'id' : [], 'target' : []}
+    index = 0
+    for row in predictions:       
+        valor = row
+        alvo = 0
+        if valor > 0.5:
+            alvo = 1
+     
+        subm['id'].append(ids[index])
+        subm['target'].append(alvo)
+        index += 1
+        
+    subdf = pd.DataFrame(subm)
+    subdf.to_csv('/posgraduacao/wsdm/' + nomeArquivo + '.csv.gz', compression = 'gzip', index=False, float_format = '%.5f')
+    print("Arquivo gerado ", nomeArquivo)
+
+# %%
+def convertCategory(data):
+    data.msno = data.msno.astype('category')
+    data.song_id = data.song_id.astype('category')
+    data.source_system_tab = data.source_system_tab.astype('category')
+    data.source_type = data.source_type.astype('category')
+    data.source_screen_name = data.source_screen_name.astype('category')
+    data.ano = data.ano.astype('category')
+    data.artist = data.artist.astype('category')
+    data.songname = data.songname.astype('category')
+    data.language = data.language.astype('category')    
+    data.pais = data.pais.astype('category')
+    data.produtor = data.produtor.astype('category')
+    data.song_length = data.song_length.astype('category')
+    data.city = data.city.astype('category')
+    data.registered_via = data.registered_via.astype('category')
+    data.expiration_date = data.expiration_date.astype('category')
+    data.registration_init_time = data.registration_init_time.astype('category')
+    data.bd = data.bd.astype('category')    
+    data.genero = data.genero.astype('category')
+    return data
+# %%
+X_train = convertCategory(train)
+#X_train.dtypes
+y_train = X_train['target'].values
+X_train = X_train.drop(['target'], axis=1)
+
+X_train.columns
+X_test = convertCategory(test)
+
+ids = X_test['id'].values
+X_test = X_test.drop(['id'], axis=1)
+
+X_test.columns
+X_test.info()
+train.info()
+
+print("correlacao execucao 1 - treino")
+sns.heatmap(X_train.corr())
+print("correlacao execucao 1 - test")
+sns.heatmap(X_test.corr())
+
+print("Início do Aplicacao", str(datetime.now()))
+d_train_final = lgb.Dataset(X_train, y_train)
+watchlist_final = lgb.Dataset(X_train, y_train)
+params = {
+        'max_depth': 20,        
+        'num_leaves': 108,
+        'feature_fraction': 0.8,
+        'bagging_fraction': 0.95,        
+        'feature_fraction_seed': 1,
+        'objective': 'binary',        
+        'boosting': 'gbdt',
+        'learning_rate': 0.3 ,
+        'bagging_freq': 1,
+        'bagging_seed': 1,
+        'num_boost_round': 250
+    }
+params['metric'] = ['auc', 'binary_logloss']
+
+print('Modelo - 1')
+model_f1 = lgb.train(params, train_set=d_train_final, valid_sets=watchlist_final, verbose_eval=10)
+print("modelo 1 - concluido ", str(datetime.now()))
+print('Making predictions')
+p_test_1 = model_f1.predict(X_test)
+print("modelo 1 - predict - concluido ", str(datetime.now()))
+gerarArqSubmete(p_test_1, 'lgb7c1github_1')
+print("modelo 1 - arquivo gerado ", str(datetime.now()))
+
+params = {
+        'objective': 'binary',
+        'boosting': 'dart',
+        'learning_rate': 0.3 ,
+        'num_leaves': 108,
+        'bagging_fraction': 0.95,
+        'bagging_freq': 1,
+        'bagging_seed': 1,
+        'feature_fraction': 0.8,
+        'feature_fraction_seed': 1,
+        'max_depth': 20,
+        'num_rounds': 250
+    }
+params['metric'] = ['auc', 'binary_logloss']
+
+print('Modelo - 2')
+model_f2 = lgb.train(params, train_set=d_train_final, valid_sets=watchlist_final, verbose_eval=10)
+print("modelo 2 - concluido ", str(datetime.now()))
+p_test_2 = model_f2.predict(X_test)
+print("modelo 2 - predict - concluido ", str(datetime.now()))
+p_test_avg = np.mean([p_test_1, p_test_2], axis = 0)
+print("avg - predict - concluido ", str(datetime.now()))
+gerarArqSubmete(p_test_avg, 'lgb7c0github_1')
+gerarArqSubmete(p_test_2, 'lgb7c2github_1')
+
+print(model_f1.best_score)
+print(model_f2.best_score)
+#model_f1.feature_name()
+print("importancia - model 1")
+lgb.plot_importance(model_f1)
+print("importancia - model 2")
+lgb.plot_importance(model_f2)
+
+# ================================================
+print("Inicio 2 ", str(datetime.now()))
+X_train = X_train.drop(['msno'], axis=1)
+X_train = X_train.drop(['song_id'], axis=1)
+X_train = X_train.drop(['pais'], axis=1)
+#X_train = X_train.drop(['bd'], axis=1)
+
+X_test = X_test.drop(['msno'], axis=1)
+X_test = X_test.drop(['song_id'], axis=1)
+X_test = X_test.drop(['pais'], axis=1)
+#X_test = X_test.drop(['bd'], axis=1)
+
+sns.heatmap(X_train.corr())
+sns.heatmap(X_test.corr())
+
+X_test.columns
+
+d_train_final = lgb.Dataset(X_train, y_train)
+watchlist_final = lgb.Dataset(X_train, y_train)
+params = {
+        'max_depth': 20,        
+        'num_leaves': 108,
+        'feature_fraction': 0.8,
+        'bagging_fraction': 0.95,        
+        'feature_fraction_seed': 1,
+        'objective': 'binary',        
+        'boosting': 'gbdt',
+        'learning_rate': 0.3 ,
+        'bagging_freq': 1,
+        'bagging_seed': 1,
+        'num_boost_round': 250
+    }
+
+params['metric'] = ['auc', 'binary_logloss']
+
+print('Modelo - 1')
+model_f1 = lgb.train(params, train_set=d_train_final, valid_sets=watchlist_final, verbose_eval=10)
+print("2-Modelo 1 - concluido ", str(datetime.now()))
+
+params = {
+        'objective': 'binary',
+        'boosting': 'dart',
+        'learning_rate': 0.3 ,
+        'num_leaves': 108,
+        'bagging_fraction': 0.95,
+        'bagging_freq': 1,
+        'bagging_seed': 1,
+        'feature_fraction': 0.8,
+        'feature_fraction_seed': 1,
+        'max_depth': 20,
+        'num_rounds': 250
+    }
+
+params['metric'] = ['auc', 'binary_logloss']
+
+print('Modelo - 2')
+model_f2 = lgb.train(params, train_set=d_train_final, valid_sets=watchlist_final, verbose_eval=10)
+print("2-Modelo 2 - concluido ", str(datetime.now()))
+print('Making predictions')
+p_test_1 = model_f1.predict(X_test)
+print("2-Modelo 1 - predict - concluido ", str(datetime.now()))
+p_test_2 = model_f2.predict(X_test)
+print("2-Modelo 2 - predict - concluido ", str(datetime.now()))
+p_test_avg = np.mean([p_test_1, p_test_2], axis = 0)
+
+gerarArqSubmete(p_test_avg, 'lgb7c0final_11')
+gerarArqSubmete(p_test_1, 'lgb7c1final_11')
+gerarArqSubmete(p_test_2, 'lgb7c2final_11')
+print("auc - model 1")
+print(model_f1.best_score)
+print("auc - model 2")
+print(model_f2.best_score)
+#model_f1.feature_name()
+print("importancia - model 1")
+lgb.plot_importance(model_f1)
+print("importancia - model 2")
+lgb.plot_importance(model_f2)
+
+print("Fim do Aplicacao", str(datetime.now()))
